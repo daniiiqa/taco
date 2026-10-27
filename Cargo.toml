@@ -1,0 +1,16 @@
+[package]
+name = "taco"
+version = "0.1.0"
+edition = "2024"
+description = "Tus archivos bien envueltos: el explorador de archivos de discada, en la terminal"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+serde_json = "1"
+unicode-width = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
