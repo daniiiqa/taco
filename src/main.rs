@@ -455,6 +455,30 @@ impl App {
         self.job = Some((0, 0, l("pegando…", "pasting…").into()));
     }
 
+    /// Lo marcado (o lo de abajo del cursor) al cel, con picha, en su propia ventana.
+    fn send_to_phone(&mut self) {
+        let files: Vec<PathBuf> = self.targets().into_iter().filter(|p| p.is_file()).collect();
+        if files.is_empty() {
+            return self.warn(l("Elige archivos (no carpetas) para el cel", "Pick files (not folders) for the phone"));
+        }
+        let sent = Command::new("setsid")
+            .arg("-f")
+            .args(["kitty", "--class", "picha", "-e", "picha"])
+            .args(&files)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if sent {
+            let n = files.len();
+            self.marked.clear();
+            self.say(format!("{} {n} {}", l("Al cel:", "To the phone:"), if n == 1 { l("archivo", "file") } else { l("archivos", "files") }));
+        } else {
+            self.warn(l("Falta picha", "picha is missing"));
+        }
+    }
+
     fn copy_to_clipboard(&mut self, text: String) {
         let child = Command::new("wl-copy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
         match child {
@@ -775,6 +799,7 @@ impl App {
             KeyCode::Char('C') => self.copy_to_clipboard(self.cwd.display().to_string()),
             KeyCode::Char('J') => self.pv_scroll += 5,
             KeyCode::Char('K') => self.pv_scroll = self.pv_scroll.saturating_sub(5),
+            KeyCode::Char('P') => self.send_to_phone(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
@@ -1244,6 +1269,7 @@ impl App {
                     ("J  K", "mover la vista previa", "scroll the preview"),
                     ("c  C", "copiar la ruta · la de la carpeta", "copy the path · the folder's"),
                     ("!", "una terminal aquí", "a shell here"),
+                    ("P", "al cel (picha)", "to the phone (picha)"),
                     ("q  Q", "salir (y cd a donde quedó) · salir", "quit (and cd there) · quit"),
                 ];
                 let inner = self.popup(f, 84, keys.len() as u16 + 2, l("teclas", "keys"));
