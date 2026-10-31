@@ -1,7 +1,11 @@
 //! taco — tus archivos bien envueltos: el explorador de archivos de discada,
 //! en la terminal, con el look del rice (como rola y vato).
 //!
-//!   taco [carpeta|archivo] [--cwd-file RUTA]
+//!   taco [carpeta|archivo] [--cwd-file RUTA] [--choose RUTA]
+//!
+//! `--choose`: para elegir archivos desde otra app (picha): enter sobre un archivo
+//! (o lo marcado) escribe sus rutas en RUTA, una por renglón, y sale; q sale sin
+//! elegir.
 //!
 //! Tres columnas: la carpeta de arriba, la de ahora y la vista previa. Las
 //! teclas son las de yazi/ranger (h j k l, espacio marca, y copia, x corta,
@@ -131,6 +135,8 @@ struct App {
     run: Option<Run>,
     quit: bool,
     cwd_file: Option<PathBuf>,
+    /// `--choose`: enter elige en vez de abrir, y escribe las rutas aquí.
+    choose: Option<PathBuf>,
 }
 
 fn xdg_dir(key: &str, fallback: &str) -> PathBuf {
@@ -215,6 +221,7 @@ impl App {
             run: None,
             quit: false,
             cwd_file,
+            choose: None,
         };
         if !a.load(&start, select) {
             a.load(&files::home(), None);
@@ -328,6 +335,15 @@ impl App {
         let Some(e) = self.current().cloned() else { return };
         if e.dir {
             self.load(&e.path, None);
+            return;
+        }
+        if let Some(f) = &self.choose {
+            let paths: Vec<String> = self.targets().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            let _ = std::fs::write(f, paths.join("\n") + "\n");
+            if let Some(c) = &self.cwd_file {
+                let _ = std::fs::write(c, self.cwd.as_os_str().as_encoded_bytes());
+            }
+            self.quit = true;
             return;
         }
         if self.marked.len() > 1 {
@@ -945,6 +961,9 @@ impl App {
         if !self.marked.is_empty() {
             right.push(Span::styled(format!("+{} {}  ", self.marked.len(), self.look.tx(l("marcados", "marked"))), Style::new().fg(t.accent)));
         }
+        if self.choose.is_some() {
+            right.push(Span::styled(format!("{}  ", self.look.tx(l("enter elige · espacio marca", "enter chooses · space marks"))), Style::new().fg(t.primary)));
+        }
         if let Some((p, cut)) = &self.clip {
             let what = if *cut { l("cortados", "cut") } else { l("copiados", "copied") };
             right.push(Span::styled(format!("{} {}  ", p.len(), self.look.tx(what)), Style::new().fg(t.muted)));
@@ -1383,10 +1402,11 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut start = None;
     let mut cwd_file = None;
+    let mut choose = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
-                println!("taco [{}] [--cwd-file {}]", l("carpeta|archivo", "folder|file"), l("RUTA", "PATH"));
+                println!("taco [{}] [--cwd-file {}] [--choose {}]", l("carpeta|archivo", "folder|file"), l("RUTA", "PATH"), l("RUTA", "PATH"));
                 println!("  {}", l("? dentro de taco enseña las teclas", "? inside taco shows the keys"));
                 return;
             }
@@ -1395,6 +1415,8 @@ fn main() {
                 return;
             }
             "--cwd-file" => cwd_file = args.next().map(PathBuf::from),
+            "--choose" => choose = args.next().map(PathBuf::from),
+            _ if a.starts_with("--choose=") => choose = Some(PathBuf::from(&a["--choose=".len()..])),
             _ if a.starts_with("--cwd-file=") => cwd_file = Some(PathBuf::from(&a["--cwd-file=".len()..])),
             _ => start = Some(from_uri(&a)),
         }
@@ -1407,6 +1429,7 @@ fn main() {
         (start, None)
     };
     let mut app = App::new(dir, select, cwd_file);
+    app.choose = choose;
 
     let mut term = ratatui::init();
     let _ = execute!(std::io::stdout(), event::EnableMouseCapture);
