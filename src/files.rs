@@ -237,6 +237,8 @@ pub enum Job {
     Delete(Vec<PathBuf>),
     /// (comprimido, nombre de la carpeta), destino
     Extract(Vec<(PathBuf, String)>, PathBuf),
+    /// entrar a un comprimido; true: aunque pese mucho (ya se preguntó)
+    Peek(PathBuf, bool),
 }
 
 pub enum Progress {
@@ -244,6 +246,10 @@ pub enum Progress {
     Step(usize, usize, String),
     Done(String),
     Failed(String),
+    /// (comprimido, carpeta para recorrerlo): ya se puede entrar
+    Inside(PathBuf, PathBuf),
+    /// (comprimido, bytes descomprimido): pesa mucho, preguntar antes
+    Big(PathBuf, u64),
 }
 
 pub fn worker() -> (Sender<Job>, Receiver<Progress>) {
@@ -312,6 +318,16 @@ fn run(job: Job, tx: &Sender<Progress>) -> Result<String, String> {
                 remove_all(s).map_err(|e| format!("{}: {e}", name_of(s)))?;
             }
             Ok(format!("{} {}", if es { "Borrados:" } else { "Deleted:" }, count(n)))
+        }
+        Job::Peek(src, force) => {
+            if !force && let Some(n) = crate::dentro::unpacked_size(&src) && n > crate::dentro::LIMITE {
+                let _ = tx.send(Progress::Big(src, n));
+                return Ok(String::new());
+            }
+            let _ = tx.send(Progress::Step(0, 1, name_of(&src)));
+            let root = crate::dentro::open(&src).map_err(|e| format!("{}: {e}", name_of(&src)))?;
+            let _ = tx.send(Progress::Inside(src, root));
+            Ok(String::new())
         }
         Job::Extract(srcs, dst) => {
             let n = srcs.len();

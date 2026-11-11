@@ -37,6 +37,7 @@ taco --cwd-file F    al salir con q escribe en F dónde quedó (para hacer cd)
 | `c` · `C` | copiar la ruta · la de la carpeta |
 | `!` | una terminal aquí (`exit` para volver) |
 | `X` | descomprimir: eliges a dónde (escribiendo o, con `ctrl+o`, navegando) y el nombre de la carpeta |
+| `enter` · `l` en un comprimido | entrar como a una carpeta (solo lectura): vista previa, abrir y copiar hacia fuera con `y` `p`; al salir se borra la copia |
 | `?` | todas las teclas |
 | `q` · `Q` | salir (escribiendo `--cwd-file`) · salir |
 

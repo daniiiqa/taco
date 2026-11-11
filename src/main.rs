@@ -14,6 +14,7 @@
 //! puntero y las teclas de abajo se pueden picar.
 
 mod archive;
+mod dentro;
 mod files;
 mod icons;
 mod look;
@@ -66,6 +67,8 @@ enum Ask {
 enum Sure {
     Trash(Vec<PathBuf>),
     Delete(Vec<PathBuf>),
+    /// entrar a un comprimido que pesa mucho descomprimido
+    Peek(PathBuf),
 }
 
 enum Mode {
@@ -162,6 +165,9 @@ struct App {
     choose: Option<PathBuf>,
     /// buscando a dónde descomprimir: taco funciona normal hasta que se elige
     picking: Option<Extract>,
+    /// los comprimidos en los que se está: (el comprimido, su carpeta en la
+    /// caché). Uno dentro de otro, apilados.
+    inside: Vec<(PathBuf, PathBuf)>,
 }
 
 fn xdg_dir(key: &str, fallback: &str) -> PathBuf {
@@ -248,6 +254,7 @@ impl App {
             cwd_file,
             choose: None,
             picking: None,
+            inside: Vec::new(),
         };
         if !a.load(&start, select) {
             a.load(&files::home(), None);
@@ -299,13 +306,24 @@ impl App {
             self.remember.insert(self.cwd.clone(), name);
         }
         let keep = if same { self.current().map(|e| e.name.clone()) } else { None };
+        // se salió de un comprimido (o de varios): su copia ya no sirve
+        while let Some((_, root)) = self.inside.last() {
+            if dir.starts_with(root) {
+                break;
+            }
+            let (_, root) = self.inside.pop().expect("hay uno");
+            if let Some(slot) = root.parent() {
+                dentro::remove(slot);
+            }
+        }
         if !same {
             if self.cwd != dir {
                 self.prev_dir = Some(self.cwd.clone());
             }
             self.filter.clear();
             self.off = 0;
-            if have("zoxide") {
+            // la caché de los comprimidos no va a zoxide
+            if have("zoxide") && !dentro::is_inside(&dir) {
                 detach(Command::new("zoxide").arg("add").arg(&dir));
             }
         }
@@ -320,9 +338,14 @@ impl App {
         self.dir_mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
         self.parent.clear();
         self.parent_sel = None;
-        if let Some(up) = dir.parent()
-            && let Ok(v) = files::list(up, self.hidden, self.sort, self.rev) {
-            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // arriba de lo de un comprimido está la carpeta del comprimido, no la caché
+        let (up, me) = match self.inside.last() {
+            Some((arch, root)) if *root == dir => (arch.parent().map(Path::to_path_buf), arch.clone()),
+            _ => (dir.parent().map(Path::to_path_buf), dir.clone()),
+        };
+        if let Some(up) = up
+            && let Ok(v) = files::list(&up, self.hidden, self.sort, self.rev) {
+            let name = me.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             self.parent_sel = v.iter().position(|e| e.name == name);
             self.parent = v;
         }
@@ -350,9 +373,46 @@ impl App {
     }
 
     fn go_up(&mut self) {
+        // arriba de un comprimido: de vuelta a su carpeta, con él elegido
+        if let Some((arch, root)) = self.inside.last()
+            && *root == self.cwd
+            && let Some(up) = arch.parent().map(Path::to_path_buf)
+        {
+            let name = arch.file_name().map(|n| n.to_string_lossy().into_owned());
+            self.load(&up, name);
+            return;
+        }
         if let Some(up) = self.cwd.parent().map(Path::to_path_buf) {
             let name = self.cwd.file_name().map(|n| n.to_string_lossy().into_owned());
             self.load(&up, name);
+        }
+    }
+
+    /// Entrar a un comprimido: se descomprime en la caché (en el hilo de los
+    /// trabajos) y al terminar, `tick` entra. `force`: ya se preguntó si pesa mucho.
+    fn peek(&mut self, src: PathBuf, force: bool) {
+        let _ = self.jobs.send(Job::Peek(src, force));
+        self.job = Some((0, 0, l("abriendo…", "opening…").into()));
+    }
+
+    /// La ruta como se ve: dentro de un comprimido, `foo.zip/sub` en vez de la
+    /// caché (y uno dentro de otro, `foo.zip/bar.tar/sub`).
+    fn shown(&self, p: &Path) -> String {
+        for (arch, root) in self.inside.iter().rev() {
+            if let Ok(rel) = p.strip_prefix(root) {
+                let base = self.shown(arch);
+                return if rel.as_os_str().is_empty() { base } else { format!("{base}/{}", rel.display()) };
+            }
+        }
+        files::tilde(p)
+    }
+
+    /// La carpeta de verdad donde se está: dentro de un comprimido, la de
+    /// afuera (para no descomprimir en la caché, que se borra).
+    fn real_dir(&self) -> PathBuf {
+        match self.inside.first() {
+            Some((arch, _)) => arch.parent().map_or_else(files::home, Path::to_path_buf),
+            None => self.cwd.clone(),
         }
     }
 
@@ -362,11 +422,15 @@ impl App {
             self.load(&e.path, None);
             return;
         }
+        // un comprimido se recorre como carpeta (solo, no con varios marcados)
+        if self.choose.is_none() && self.marked.len() <= 1 && dentro::peekable(&e.path) {
+            return self.peek(e.path, false);
+        }
         if let Some(f) = &self.choose {
             let paths: Vec<String> = self.targets().iter().map(|p| p.to_string_lossy().into_owned()).collect();
             let _ = std::fs::write(f, paths.join("\n") + "\n");
             if let Some(c) = &self.cwd_file {
-                let _ = std::fs::write(c, self.cwd.as_os_str().as_encoded_bytes());
+                let _ = std::fs::write(c, self.real_dir().as_os_str().as_encoded_bytes());
             }
             self.quit = true;
             return;
@@ -511,7 +575,7 @@ impl App {
             return self.warn(l("Eso no es un comprimido", "That's not an archive"));
         };
         let name = archive::folder_name(&first.file_name().unwrap_or_default().to_string_lossy());
-        let mut x = Extract { srcs, dest: files::tilde(&self.cwd), name, on_name: false, cur: 0 };
+        let mut x = Extract { srcs, dest: files::tilde(&self.real_dir()), name, on_name: false, cur: 0 };
         x.focus(false);
         self.mode = Mode::Extract(x);
     }
@@ -524,6 +588,9 @@ impl App {
         let dest = archive::resolve(&x.dest, &self.cwd);
         if dest.exists() && !dest.is_dir() {
             return Some(l("Ese destino no es una carpeta", "That destination isn't a folder"));
+        }
+        if dentro::is_inside(&dest) {
+            return Some(l("Ahí no: es dentro de un comprimido", "Not there: that's inside an archive"));
         }
         if x.single() {
             let name = x.name.trim();
@@ -653,10 +720,12 @@ impl App {
             Mode::Help => {}
             Mode::Confirm { sure, msg } => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('s') | KeyCode::Enter => {
-                    let _ = self.jobs.send(match sure {
+                    let job = match sure {
+                        Sure::Peek(p) => return self.peek(p, true),
                         Sure::Trash(p) => Job::Trash(p),
                         Sure::Delete(p) => Job::Delete(p),
-                    });
+                    };
+                    let _ = self.jobs.send(job);
                     self.marked.clear();
                     self.job = Some((0, 0, "…".into()));
                 }
@@ -747,7 +816,7 @@ impl App {
         match k.code {
             KeyCode::Char('q') => {
                 if let Some(f) = &self.cwd_file {
-                    let _ = std::fs::write(f, self.cwd.as_os_str().as_encoded_bytes());
+                    let _ = std::fs::write(f, self.real_dir().as_os_str().as_encoded_bytes());
                 }
                 self.quit = true;
             }
@@ -768,7 +837,7 @@ impl App {
             KeyCode::Home => self.cur = 0,
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => self.go_up(),
             KeyCode::Char('l') | KeyCode::Right => {
-                if self.current().is_some_and(|e| e.dir) {
+                if self.current().is_some_and(|e| e.dir || dentro::peekable(&e.path)) {
                     self.open_current();
                 }
             }
@@ -1052,7 +1121,7 @@ impl App {
         // arriba: taco y la ruta; a la derecha, lo copiado y lo marcado
         let badge = format!(" {} ", self.look.tx("taco"));
         let mut left = vec![Span::styled(badge, Style::new().fg(t.base).bg(t.primary).bold()), Span::raw("  ")];
-        let path = files::tilde(&self.cwd);
+        let path = self.shown(&self.cwd);
         let (dir, last) = match path.rfind('/') {
             Some(i) => (path[..=i].to_string(), path[i + 1..].to_string()),
             None => (String::new(), path.clone()),
@@ -1076,6 +1145,9 @@ impl App {
         }
         if !self.marked.is_empty() {
             right.push(Span::styled(format!("+{} {}  ", self.marked.len(), self.look.tx(l("marcados", "marked"))), Style::new().fg(t.accent)));
+        }
+        if !self.inside.is_empty() {
+            right.push(Span::styled(format!("{}  ", self.look.tx(l("comprimido · solo lectura", "archive · read-only"))), Style::new().fg(t.accent)));
         }
         if self.picking.is_some() {
             right.push(Span::styled(format!("{}  ", self.look.tx(l("ve a la carpeta · X aquí", "go to the folder · X here"))), Style::new().fg(t.primary)));
@@ -1394,7 +1466,7 @@ impl App {
                 let keys: &[(&str, &str, &str)] = &[
                     ("j k  ↑ ↓", "moverse", "move"),
                     ("h l  ← →", "subir / entrar", "up / enter"),
-                    ("enter", "abrir (texto en el editor, lo demás con su app)", "open (text in the editor, the rest with its app)"),
+                    ("enter", "abrir (texto en el editor, un comprimido como carpeta, lo demás con su app)", "open (text in the editor, an archive as a folder, the rest with its app)"),
                     ("o", "abrir con un comando", "open with a command"),
                     ("e", "editar", "edit"),
                     ("space", "marcar · ctrl+a todo · esc nada", "mark · ctrl+a all · esc none"),
@@ -1470,8 +1542,24 @@ impl App {
                 Progress::Step(i, n, name) => self.job = Some((i, n, name)),
                 Progress::Done(msg) => {
                     self.job = None;
-                    self.say(msg);
+                    if !msg.is_empty() {
+                        self.say(msg);
+                    }
                     finished = true;
+                }
+                Progress::Inside(arch, root) => {
+                    self.inside.push((arch, root.clone()));
+                    self.load(&root, None);
+                }
+                Progress::Big(arch, bytes) => {
+                    self.job = None;
+                    let name = arch.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let msg = if spanish() {
+                        format!("{name} pesa {} descomprimido y se descomprime todo. ¿Entrar?", files::human(bytes))
+                    } else {
+                        format!("{name} is {} unpacked, and all of it gets unpacked. Go in?", files::human(bytes))
+                    };
+                    self.mode = Mode::Confirm { sure: Sure::Peek(arch), msg };
                 }
                 Progress::Failed(e) => {
                     self.job = None;
@@ -1632,6 +1720,8 @@ fn main() {
     } else {
         (start, None)
     };
+    // lo que dejaron dentro de comprimidos los tacos que se cayeron
+    dentro::clean_stale();
     let mut app = App::new(dir, select, cwd_file);
     app.choose = choose;
 
@@ -1678,4 +1768,6 @@ fn main() {
     }
     let _ = execute!(std::io::stdout(), event::DisableMouseCapture);
     ratatui::restore();
+    // los comprimidos abiertos: su copia se va con taco
+    dentro::remove(&dentro::root());
 }
