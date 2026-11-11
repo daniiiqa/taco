@@ -125,15 +125,13 @@ fn build(r: &Request) -> Kind {
             return Kind::Image(t);
         }
     }
-    if audio_ext(&ext) {
-        if let Some(info) = audio_info(&e.path) {
-            return Kind::Info(info);
-        }
+    if audio_ext(&ext)
+        && let Some(info) = audio_info(&e.path) {
+        return Kind::Info(info);
     }
-    if archive_ext(&e.name, &ext) {
-        if let Some(lines) = run_lines(Command::new("bsdtar").arg("-tf").arg(&e.path)) {
-            return Kind::Text(lines);
-        }
+    if archive_ext(&e.name, &ext)
+        && let Some(lines) = run_lines(Command::new("bsdtar").arg("-tf").arg(&e.path)) {
+        return Kind::Text(lines);
     }
     text(&e.path).map(Kind::Text).unwrap_or_else(|| {
         let what = run_lines(Command::new("file").arg("-b").arg(&e.path)).and_then(|v| v.into_iter().next());

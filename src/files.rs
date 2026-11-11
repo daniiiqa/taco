@@ -235,6 +235,8 @@ pub enum Job {
     Move(Vec<PathBuf>, PathBuf),
     Trash(Vec<PathBuf>),
     Delete(Vec<PathBuf>),
+    /// (comprimido, nombre de la carpeta), destino
+    Extract(Vec<(PathBuf, String)>, PathBuf),
 }
 
 pub enum Progress {
@@ -310,6 +312,15 @@ fn run(job: Job, tx: &Sender<Progress>) -> Result<String, String> {
                 remove_all(s).map_err(|e| format!("{}: {e}", name_of(s)))?;
             }
             Ok(format!("{} {}", if es { "Borrados:" } else { "Deleted:" }, count(n)))
+        }
+        Job::Extract(srcs, dst) => {
+            let n = srcs.len();
+            let mut last = dst.clone();
+            for (i, (s, name)) in srcs.iter().enumerate() {
+                let _ = tx.send(Progress::Step(i, n, name_of(s)));
+                last = crate::archive::extract(s, &dst, name).map_err(|e| format!("{}: {e}", name_of(s)))?;
+            }
+            Ok(format!("{} {}", if es { "Descomprimido en" } else { "Extracted to" }, tilde(if n == 1 { &last } else { &dst })))
         }
     }
 }

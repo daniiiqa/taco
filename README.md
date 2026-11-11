@@ -36,6 +36,7 @@ taco --cwd-file F    al salir con q escribe en F dónde quedó (para hacer cd)
 | `J` `K` | mover la vista previa |
 | `c` · `C` | copiar la ruta · la de la carpeta |
 | `!` | una terminal aquí (`exit` para volver) |
+| `X` | descomprimir: eliges a dónde (escribiendo o, con `ctrl+o`, navegando) y el nombre de la carpeta |
 | `?` | todas las teclas |
 | `q` · `Q` | salir (escribiendo `--cwd-file`) · salir |
 
@@ -44,6 +45,13 @@ Vista previa: texto, carpetas, imágenes (con el protocolo de kitty), video
 comprimido (`bsdtar`) y los datos de una canción (`ffprobe`). Las miniaturas
 quedan en `~/.cache/taco`. Si falta alguno de esos programas, esa vista
 previa no sale y ya.
+
+Para descomprimir, taco mira los primeros bytes del archivo y elige con qué:
+`bsdtar` (zip, tar.\*, rar, iso, deb…), `7z` para lo que `bsdtar` no abra, y
+`bsdcat` para un solo archivo comprimido (`notas.txt.gz`). Si lo de adentro ya
+venía en una sola carpeta, esa toma el nombre que elegiste, en vez de quedar
+`foo/foo/`. Si algo falla no queda nada a medias. Con varios marcados, cada uno
+va a su propia carpeta. Los que tienen contraseña todavía no se pueden abrir.
 
 Ratón, como en vato: clic elige, doble clic abre, clic derecho marca, la rueda
 va donde esté el puntero (la lista o la vista previa), clic en la columna de

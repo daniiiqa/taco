@@ -13,6 +13,7 @@
 //! clic elige, doble clic abre, clic derecho marca, la rueda va donde esté el
 //! puntero y las teclas de abajo se pueden picar.
 
+mod archive;
 mod files;
 mod icons;
 mod look;
@@ -74,7 +75,29 @@ enum Mode {
     Input { ask: Ask, buf: String, cur: usize },
     Confirm { sure: Sure, msg: String },
     Mounts { drives: Vec<mounts::Drive>, sel: usize },
+    Extract(Extract),
     Help,
+}
+
+/// La ventanita de descomprimir: a dónde y con qué nombre.
+struct Extract {
+    srcs: Vec<PathBuf>,
+    dest: String,
+    /// con varios comprimidos no se usa: cada uno se queda con su nombre
+    name: String,
+    on_name: bool,
+    /// el cursor, en el campo que esté activo
+    cur: usize,
+}
+
+impl Extract {
+    fn single(&self) -> bool {
+        self.srcs.len() == 1
+    }
+    fn focus(&mut self, on_name: bool) {
+        self.on_name = on_name && self.single();
+        self.cur = if self.on_name { self.name.chars().count() } else { self.dest.chars().count() };
+    }
 }
 
 /// Lo que necesita la terminal entera (se suspende taco mientras).
@@ -137,6 +160,8 @@ struct App {
     cwd_file: Option<PathBuf>,
     /// `--choose`: enter elige en vez de abrir, y escribe las rutas aquí.
     choose: Option<PathBuf>,
+    /// buscando a dónde descomprimir: taco funciona normal hasta que se elige
+    picking: Option<Extract>,
 }
 
 fn xdg_dir(key: &str, fallback: &str) -> PathBuf {
@@ -222,6 +247,7 @@ impl App {
             quit: false,
             cwd_file,
             choose: None,
+            picking: None,
         };
         if !a.load(&start, select) {
             a.load(&files::home(), None);
@@ -294,12 +320,11 @@ impl App {
         self.dir_mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
         self.parent.clear();
         self.parent_sel = None;
-        if let Some(up) = dir.parent() {
-            if let Ok(v) = files::list(up, self.hidden, self.sort, self.rev) {
-                let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.parent_sel = v.iter().position(|e| e.name == name);
-                self.parent = v;
-            }
+        if let Some(up) = dir.parent()
+            && let Ok(v) = files::list(up, self.hidden, self.sort, self.rev) {
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.parent_sel = v.iter().position(|e| e.name == name);
+            self.parent = v;
         }
         self.pv_want = None;
         true
@@ -479,6 +504,59 @@ impl App {
         }
     }
 
+    /// Lo marcado (o lo de abajo del cursor) que sí sea comprimido: preguntar a dónde.
+    fn ask_extract(&mut self) {
+        let srcs: Vec<PathBuf> = self.targets().into_iter().filter(|p| archive::is_archive(p)).collect();
+        let Some(first) = srcs.first() else {
+            return self.warn(l("Eso no es un comprimido", "That's not an archive"));
+        };
+        let name = archive::folder_name(&first.file_name().unwrap_or_default().to_string_lossy());
+        let mut x = Extract { srcs, dest: files::tilde(&self.cwd), name, on_name: false, cur: 0 };
+        x.focus(false);
+        self.mode = Mode::Extract(x);
+    }
+
+    /// Por qué no se puede descomprimir así. La ventanita lo enseña mientras se escribe.
+    fn extract_problem(&self, x: &Extract) -> Option<&'static str> {
+        if x.dest.trim().is_empty() {
+            return Some(l("Falta a dónde", "Where to?"));
+        }
+        let dest = archive::resolve(&x.dest, &self.cwd);
+        if dest.exists() && !dest.is_dir() {
+            return Some(l("Ese destino no es una carpeta", "That destination isn't a folder"));
+        }
+        if x.single() {
+            let name = x.name.trim();
+            if name.is_empty() {
+                return Some(l("Falta el nombre", "It needs a name"));
+            }
+            if name.contains('/') || name == "." || name == ".." {
+                return Some(l("El nombre no puede llevar /", "The name can't have a /"));
+            }
+            if std::fs::symlink_metadata(dest.join(name)).is_ok() {
+                return Some(l("Ya existe, elige otro nombre", "Already exists, pick another name"));
+            }
+        }
+        None
+    }
+
+    fn start_extract(&mut self, x: Extract) {
+        let dest = archive::resolve(&x.dest, &self.cwd);
+        let single = x.single();
+        let name = x.name.trim().to_string();
+        let list = x
+            .srcs
+            .into_iter()
+            .map(|p| {
+                let n = if single { name.clone() } else { archive::folder_name(&p.file_name().unwrap_or_default().to_string_lossy()) };
+                (p, n)
+            })
+            .collect();
+        let _ = self.jobs.send(Job::Extract(list, dest));
+        self.marked.clear();
+        self.job = Some((0, 0, l("descomprimiendo…", "extracting…").into()));
+    }
+
     fn copy_to_clipboard(&mut self, text: String) {
         let child = Command::new("wl-copy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
         match child {
@@ -528,7 +606,45 @@ impl App {
     fn key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match std::mem::replace(&mut self.mode, Mode::Normal) {
-            Mode::Normal => self.key_normal(k, ctrl),
+            Mode::Normal => {
+                let here = k.code == KeyCode::Char('X') || (ctrl && k.code == KeyCode::Char('o'));
+                if self.picking.is_some() && (here || k.code == KeyCode::Esc) {
+                    let mut x = self.picking.take().unwrap();
+                    if here {
+                        x.dest = files::tilde(&self.cwd);
+                        x.focus(true);
+                    } else {
+                        x.focus(x.on_name);
+                    }
+                    self.mode = Mode::Extract(x);
+                } else {
+                    self.key_normal(k, ctrl);
+                }
+            }
+            Mode::Extract(mut x) => {
+                match k.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Enter => {
+                        if self.extract_problem(&x).is_none() {
+                            self.start_extract(x);
+                        } else {
+                            self.mode = Mode::Extract(x);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('o') if ctrl => {
+                        self.picking = Some(x);
+                        return;
+                    }
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => x.focus(!x.on_name),
+                    _ => {
+                        let on_name = x.on_name;
+                        let buf = if on_name { &mut x.name } else { &mut x.dest };
+                        edit_line(buf, &mut x.cur, k, ctrl);
+                    }
+                }
+                self.mode = Mode::Extract(x);
+            }
             Mode::Goto => {
                 if let KeyCode::Char(c) = k.code {
                     self.goto(c);
@@ -594,7 +710,6 @@ impl App {
                 self.mode = Mode::Mounts { drives, sel };
             }
             Mode::Input { ask, mut buf, mut cur } => {
-                let at = |s: &str, c: usize| s.char_indices().nth(c).map(|(i, _)| i).unwrap_or(s.len());
                 match k.code {
                     KeyCode::Esc => {
                         if matches!(ask, Ask::Filter) {
@@ -607,36 +722,7 @@ impl App {
                         self.submit(ask, buf);
                         return;
                     }
-                    KeyCode::Char('u') if ctrl => {
-                        buf.clear();
-                        cur = 0;
-                    }
-                    KeyCode::Char('w') if ctrl => {
-                        let before: String = buf.chars().take(cur).collect();
-                        let keep = before.trim_end().rfind(' ').map(|i| i + 1).unwrap_or(0);
-                        let after: String = buf.chars().skip(cur).collect();
-                        buf = format!("{}{after}", &before[..keep]);
-                        cur = before[..keep].chars().count();
-                    }
-                    KeyCode::Char(c) => {
-                        let i = at(&buf, cur);
-                        buf.insert(i, c);
-                        cur += 1;
-                    }
-                    KeyCode::Backspace if cur > 0 => {
-                        let i = at(&buf, cur - 1);
-                        buf.remove(i);
-                        cur -= 1;
-                    }
-                    KeyCode::Delete if cur < buf.chars().count() => {
-                        let i = at(&buf, cur);
-                        buf.remove(i);
-                    }
-                    KeyCode::Left => cur = cur.saturating_sub(1),
-                    KeyCode::Right => cur = (cur + 1).min(buf.chars().count()),
-                    KeyCode::Home => cur = 0,
-                    KeyCode::End => cur = buf.chars().count(),
-                    _ => {}
+                    _ => edit_line(&mut buf, &mut cur, k, ctrl),
                 }
                 if matches!(ask, Ask::Filter) {
                     self.filter = buf.clone();
@@ -800,6 +886,7 @@ impl App {
             KeyCode::Char('J') => self.pv_scroll += 5,
             KeyCode::Char('K') => self.pv_scroll = self.pv_scroll.saturating_sub(5),
             KeyCode::Char('P') => self.send_with_picha(),
+            KeyCode::Char('X') => self.ask_extract(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
@@ -833,6 +920,10 @@ impl App {
                         if double {
                             self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                         }
+                        return;
+                    }
+                    (Mode::Extract(x), Some(Hit::Row(i))) => {
+                        x.focus(i == 1);
                         return;
                     }
                     (_, Some(Hit::Key(code))) => {
@@ -986,6 +1077,9 @@ impl App {
         if !self.marked.is_empty() {
             right.push(Span::styled(format!("+{} {}  ", self.marked.len(), self.look.tx(l("marcados", "marked"))), Style::new().fg(t.accent)));
         }
+        if self.picking.is_some() {
+            right.push(Span::styled(format!("{}  ", self.look.tx(l("ve a la carpeta · X aquí", "go to the folder · X here"))), Style::new().fg(t.primary)));
+        }
         if self.choose.is_some() {
             right.push(Span::styled(format!("{}  ", self.look.tx(l("enter elige · espacio marca", "enter chooses · space marks"))), Style::new().fg(t.primary)));
         }
@@ -1080,10 +1174,9 @@ impl App {
                 v.push(Span::styled(format!("  {}", files::human(e.size)), Style::new().fg(t.fg)));
             }
             v.push(Span::styled(format!("  {}", files::date(e.mtime)), Style::new().fg(t.muted)));
-            if e.link {
-                if let Ok(to) = std::fs::read_link(&e.path) {
-                    v.push(Span::styled(format!("  → {}", files::tilde(&to)), Style::new().fg(t.accent)));
-                }
+            if e.link
+                && let Ok(to) = std::fs::read_link(&e.path) {
+                v.push(Span::styled(format!("  → {}", files::tilde(&to)), Style::new().fg(t.accent)));
             }
         }
         f.render_widget(Paragraph::new(Line::from(v)), info);
@@ -1116,6 +1209,22 @@ impl App {
                     Mode::Confirm { .. } => vec![("y", l("sí", "yes")), ("n", "no")],
                     Mode::Mounts { .. } => vec![("enter", l("montar y abrir", "mount and open")), ("u", l("desmontar", "unmount")), ("e", l("expulsar", "eject")), ("esc", l("cerrar", "close"))],
                     Mode::Help => vec![("esc", l("cerrar", "close"))],
+                    Mode::Extract(x) => {
+                        let mut v = vec![("enter", l("descomprimir", "extract"))];
+                        if x.single() {
+                            v.push(("tab", l("cambiar de campo", "switch field")));
+                        }
+                        v.push(("ctrl+o", l("buscar la carpeta", "browse for the folder")));
+                        v.push(("esc", l("cancelar", "cancel")));
+                        v
+                    }
+                    Mode::Normal if self.picking.is_some() => vec![
+                        ("X", l("descomprimir aquí", "extract here")),
+                        ("esc", l("volver", "back")),
+                        ("g", l("ir a", "go to")),
+                        ("z", l("saltar", "jump")),
+                        ("a", l("nuevo (con / es carpeta)", "new (ending in / makes a folder)")),
+                    ],
                     Mode::Normal => vec![
                         ("enter", l("abrir", "open")),
                         ("space", l("marcar", "mark")),
@@ -1129,6 +1238,7 @@ impl App {
                         ("z", l("saltar", "jump")),
                         ("g", l("ir a", "go to")),
                         ("M", "usb"),
+                        ("X", l("descomprimir", "extract")),
                         ("?", l("ayuda", "help")),
                         ("q", l("salir", "quit")),
                     ],
@@ -1146,6 +1256,7 @@ impl App {
                         "enter" => Some(KeyCode::Enter),
                         "esc" => Some(KeyCode::Esc),
                         "space" => Some(KeyCode::Char(' ')),
+                        "tab" => Some(KeyCode::Tab),
                         _ if k.chars().count() == 1 => k.chars().next().map(KeyCode::Char),
                         _ => None,
                     };
@@ -1248,6 +1359,37 @@ impl App {
                 }
                 f.render_widget(Paragraph::new(lines), inner);
             }
+            Mode::Extract(x) => {
+                let first = x.srcs[0].file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let title = if x.single() { format!("{} {first}", l("descomprimir", "extract")) } else { format!("{} {}", l("descomprimir", "extract"), x.srcs.len()) };
+                let w = (x.dest.width().max(x.name.width()).max(title.width()) as u16 + 16).max(56);
+                let inner = self.popup(f, w, if x.single() { 5 } else { 4 }, &title);
+                let field = |label: &str, buf: &str, on: bool| {
+                    let mut line = if on { input(buf, x.cur) } else { Line::from(Span::styled(format!(" {buf}"), Style::new().fg(t.fg))) };
+                    let st = if on { Style::new().fg(t.primary).bold() } else { Style::new().fg(t.muted) };
+                    line.spans.insert(0, Span::styled(format!(" {:<8}", self.look.tx(label)), st));
+                    line
+                };
+                let mut lines = vec![field(l("dónde", "where"), &x.dest, !x.on_name)];
+                if x.single() {
+                    lines.push(field(l("carpeta", "folder"), &x.name, x.on_name));
+                }
+                // lo que va a pasar, o por qué no se puede
+                let dest = archive::resolve(&x.dest, &self.cwd);
+                let last = match self.extract_problem(x) {
+                    Some(why) => Span::styled(format!(" {why}"), Style::new().fg(t.red)),
+                    None => {
+                        let to = if x.single() { files::tilde(&dest.join(x.name.trim())) } else { format!("{}/…  ({})", files::tilde(&dest), l("cada uno en su carpeta", "each in its own folder")) };
+                        let new = if dest.exists() { "" } else { l("  (carpeta nueva)", "  (new folder)") };
+                        Span::styled(format!(" → {}{new}", trunc(&to, (inner.width as usize).saturating_sub(4 + new.width()))), Style::new().fg(t.accent))
+                    }
+                };
+                lines.push(Line::from(last));
+                for i in 0..lines.len().saturating_sub(1).min(inner.height as usize) {
+                    self.hits.push((Rect { x: inner.x, y: inner.y + i as u16, width: inner.width, height: 1 }, Hit::Row(i)));
+                }
+                f.render_widget(Paragraph::new(lines), inner);
+            }
             Mode::Help => {
                 let keys: &[(&str, &str, &str)] = &[
                     ("j k  ↑ ↓", "moverse", "move"),
@@ -1270,6 +1412,7 @@ impl App {
                     ("c  C", "copiar la ruta · la de la carpeta", "copy the path · the folder's"),
                     ("!", "una terminal aquí", "a shell here"),
                     ("P", "mandar con picha", "send with picha"),
+                    ("X", "descomprimir: eliges a dónde y el nombre de la carpeta", "extract: you pick where and the folder name"),
                     ("q  Q", "salir (y cd a donde quedó) · salir", "quit (and cd there) · quit"),
                 ];
                 let inner = self.popup(f, 84, keys.len() as u16 + 2, l("teclas", "keys"));
@@ -1304,17 +1447,16 @@ impl App {
         }
         // esperar a que el cursor se quede quieto un momento (al pasar rápido
         // por muchas imágenes no se pinta cada una)
-        if let Some((p, r)) = want {
-            if self.img_since.elapsed() >= Duration::from_millis(90) && r.width > 2 && r.height > 1 {
-                let _ = Command::new("kitten")
-                    .args(["icat", "--stdin=no", "--transfer-mode=file", "--align=left", "--place"])
-                    .arg(format!("{}x{}@{}x{}", r.width, r.height, r.x, r.y))
-                    .arg(&p)
-                    .stdin(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                self.img_placed = Some((p, r));
-            }
+        if let Some((p, r)) = want
+            && self.img_since.elapsed() >= Duration::from_millis(90) && r.width > 2 && r.height > 1 {
+            let _ = Command::new("kitten")
+                .args(["icat", "--stdin=no", "--transfer-mode=file", "--align=left", "--place"])
+                .arg(format!("{}x{}@{}x{}", r.width, r.height, r.x, r.y))
+                .arg(&p)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            self.img_placed = Some((p, r));
         }
     }
 
@@ -1350,6 +1492,43 @@ impl App {
             }
         }
         self.ask_preview();
+    }
+}
+
+/// Lo que hace una tecla en un campo de texto.
+fn edit_line(buf: &mut String, cur: &mut usize, k: KeyEvent, ctrl: bool) {
+    let at = |s: &str, c: usize| s.char_indices().nth(c).map(|(i, _)| i).unwrap_or(s.len());
+    match k.code {
+        KeyCode::Char('u') if ctrl => {
+            buf.clear();
+            *cur = 0;
+        }
+        KeyCode::Char('w') if ctrl => {
+            let before: String = buf.chars().take(*cur).collect();
+            let keep = before.trim_end().rfind(' ').map(|i| i + 1).unwrap_or(0);
+            let after: String = buf.chars().skip(*cur).collect();
+            *buf = format!("{}{after}", &before[..keep]);
+            *cur = before[..keep].chars().count();
+        }
+        KeyCode::Char(c) => {
+            let i = at(buf, *cur);
+            buf.insert(i, c);
+            *cur += 1;
+        }
+        KeyCode::Backspace if *cur > 0 => {
+            let i = at(buf, *cur - 1);
+            buf.remove(i);
+            *cur -= 1;
+        }
+        KeyCode::Delete if *cur < buf.chars().count() => {
+            let i = at(buf, *cur);
+            buf.remove(i);
+        }
+        KeyCode::Left => *cur = cur.saturating_sub(1),
+        KeyCode::Right => *cur = (*cur + 1).min(buf.chars().count()),
+        KeyCode::Home => *cur = 0,
+        KeyCode::End => *cur = buf.chars().count(),
+        _ => {}
     }
 }
 
@@ -1411,12 +1590,11 @@ fn from_uri(s: &str) -> PathBuf {
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%' && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -1490,11 +1668,7 @@ fn main() {
             match event::read() {
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => app.key(k),
                 Ok(Event::Mouse(m)) => app.mouse(m),
-                Ok(Event::Resize(..)) => {
-                    if app.img_placed.take().is_some() {
-                        icat_clear();
-                    }
-                }
+                Ok(Event::Resize(..)) if app.img_placed.take().is_some() => icat_clear(),
                 _ => {}
             }
         }
