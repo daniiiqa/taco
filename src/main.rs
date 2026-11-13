@@ -328,6 +328,11 @@ impl App {
             }
         }
         self.cwd = dir.clone();
+        // el proceso también se para ahí: así lo de fuera (bicho, por ejemplo)
+        // sabe en qué carpeta andas con /proc/PID/cwd
+        if !dentro::is_inside(&dir) {
+            let _ = std::env::set_current_dir(&dir);
+        }
         self.all = list;
         self.cur = 0;
         self.refilter();
