@@ -214,6 +214,93 @@ pub fn extract(src: &Path, dest: &Path, name: &str) -> Result<PathBuf, String> {
     r
 }
 
+// ── comprimir ────────────────────────────────────────────────────────────────
+
+/// Los formatos para comprimir, en el orden en que se van cambiando. zip
+/// primero: es el que abre cualquiera (Windows, el cel).
+pub const FORMATS: [&str; 6] = [".zip", ".tar.zst", ".tar.gz", ".tar.xz", ".7z", ".tar"];
+
+/// La extensión de formato que trae el nombre (la más larga: .tar.gz antes que .tar).
+pub fn format_of(name: &str) -> Option<&'static str> {
+    let low = name.to_ascii_lowercase();
+    FORMATS.iter().copied().filter(|f| low.len() > f.len() && low.ends_with(f)).max_by_key(|f| f.len())
+}
+
+/// Qué le dice a bsdtar cada formato. El nombre de la temporal no termina en
+/// la extensión, por eso no sirve `-a`.
+fn format_flags(ext: &str) -> &'static [&'static str] {
+    match ext {
+        ".zip" => &["--format", "zip"],
+        ".7z" => &["--format", "7zip"],
+        ".tar.zst" => &["--zstd"],
+        ".tar.gz" => &["-z"],
+        ".tar.xz" => &["-J"],
+        _ => &[],
+    }
+}
+
+/// mods.zip → mods.tar.zst: cambiar al siguiente formato sin tocar el nombre.
+pub fn next_format(name: &str) -> String {
+    let (stem, i) = match format_of(name) {
+        Some(f) => (&name[..name.len() - f.len()], FORMATS.iter().position(|x| *x == f).unwrap() + 1),
+        None => (name, 0),
+    };
+    format!("{stem}{}", FORMATS[i % FORMATS.len()])
+}
+
+/// El nombre que se propone: la carpeta o el archivo (sin su extensión) + .zip,
+/// y si ya existe, mods_1.zip, mods_2.zip…
+pub fn pack_name(first: &Path, many: bool, cwd: &Path, dest: &Path) -> String {
+    let base = if many {
+        name_of(cwd)
+    } else {
+        let n = name_of(first);
+        match n.rsplit_once('.') {
+            Some((s, _)) if !s.is_empty() && !first.is_dir() => s.to_string(),
+            _ => n,
+        }
+    };
+    let base = if base.is_empty() { "taco".to_string() } else { base };
+    (0..)
+        .map(|i| if i == 0 { format!("{base}.zip") } else { format!("{base}_{i}.zip") })
+        .find(|n| fs::symlink_metadata(dest.join(n)).is_err())
+        .unwrap()
+}
+
+/// Comprimir `srcs` (cada uno con su nombre, sin la ruta de arriba) en
+/// `dest/name`, con el formato que diga la extensión. Se escribe en una
+/// temporal oculta y solo al terminar toma el nombre: si algo falla no queda
+/// nada a medias.
+pub fn compress(srcs: &[PathBuf], dest: &Path, name: &str) -> Result<PathBuf, String> {
+    let es = crate::spanish();
+    let ext = format_of(name).ok_or_else(|| if es { "No sé de qué formato es ese nombre".to_string() } else { "Unknown format for that name".to_string() })?;
+    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let to = dest.join(name);
+    if fs::symlink_metadata(&to).is_ok() {
+        return Err(if es { "Ya existe".into() } else { "Already exists".into() });
+    }
+    let tmp = files::free_name(dest, &format!(".{name}.taco"));
+    let mut cmd = Command::new("bsdtar");
+    cmd.arg("-cf").arg(&tmp).args(format_flags(ext));
+    for s in srcs {
+        let parent = s.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/"));
+        let parent = fs::canonicalize(&parent).unwrap_or(parent);
+        let n = name_of(s);
+        // que un nombre con - adelante no se lea como opción
+        let n = if n.starts_with('-') { format!("./{n}") } else { n };
+        cmd.arg("-C").arg(parent).arg(n);
+    }
+    let r = match run(cmd.stdout(Stdio::piped())) {
+        Ok(()) => fs::rename(&tmp, &to).map(|_| to).map_err(|e| e.to_string()),
+        Err(Fail::Missing) => Err(missing(es, "bsdtar (libarchive)")),
+        Err(Fail::Said(s)) => Err(s),
+    };
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +457,57 @@ mod tests {
         let _ = extract(&l.src("t.tar"), &l.out(), "x");
         assert!(!l.out().join("malo.txt").exists());
         assert!(!l.0.join("malo.txt").exists());
+    }
+    #[test]
+    fn formatos_y_nombres() {
+        assert_eq!(format_of("mods.zip"), Some(".zip"));
+        assert_eq!(format_of("a.TAR.GZ"), Some(".tar.gz"));
+        assert_eq!(format_of("a.tar"), Some(".tar"));
+        assert_eq!(format_of(".zip"), None);
+        assert_eq!(format_of("a.rar"), None);
+        assert_eq!(next_format("mods.zip"), "mods.tar.zst");
+        assert_eq!(next_format("mods.tar"), "mods.zip");
+        assert_eq!(next_format("mods"), "mods.zip");
+        let l = Lab::new("packname");
+        let src = l.0.join("src");
+        assert_eq!(pack_name(&src.join("foo"), false, &src, &src), "foo.zip");
+        assert_eq!(pack_name(&src.join("b.txt"), false, &src, &src), "b.zip");
+        assert_eq!(pack_name(&src.join("b.txt"), true, &src, &src), "src.zip");
+        fs::write(src.join("foo.zip"), "").unwrap();
+        assert_eq!(pack_name(&src.join("foo"), false, &src, &src), "foo_1.zip");
+    }
+
+    #[test]
+    fn comprimir_y_descomprimir_de_vuelta() {
+        for name in ["t.zip", "t.tar.zst", "t.tar.gz", "t.tar.xz", "t.7z", "t.tar"] {
+            let l = Lab::new(&format!("pack{}", name.replace('.', "")));
+            let srcs = [l.src("foo"), l.src("b.txt")];
+            let to = compress(&srcs, &l.out(), name).unwrap();
+            assert_eq!(to, l.out().join(name));
+            assert!(is_archive(&to), "{name}");
+            assert_eq!(l.out_names(), [name]);
+            let back = extract(&to, &l.out(), "back").unwrap();
+            assert_eq!(fs::read_to_string(back.join("foo/a.txt")).unwrap(), "hola\n", "{name}");
+            assert_eq!(fs::read_to_string(back.join("b.txt")).unwrap(), "adios\n", "{name}");
+        }
+    }
+
+    #[test]
+    fn comprimir_no_pisa_ni_deja_restos() {
+        let l = Lab::new("packfail");
+        fs::write(l.out().join("t.zip"), "mio").unwrap();
+        assert!(compress(&[l.src("foo")], &l.out(), "t.zip").is_err());
+        assert_eq!(fs::read_to_string(l.out().join("t.zip")).unwrap(), "mio");
+        assert!(compress(&[l.src("no-existe")], &l.out(), "x.zip").is_err());
+        assert!(compress(&[l.src("foo")], &l.out(), "x.rar").is_err());
+        assert_eq!(l.out_names(), ["t.zip"]);
+    }
+
+    #[test]
+    fn nombre_con_guion() {
+        let l = Lab::new("packdash");
+        fs::write(l.src("-raro.txt"), "x").unwrap();
+        let to = compress(&[l.src("-raro.txt")], &l.out(), "r.tar").unwrap();
+        assert!(extract(&to, &l.out(), "back").unwrap().join("-raro.txt").exists());
     }
 }

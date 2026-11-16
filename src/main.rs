@@ -82,11 +82,13 @@ enum Mode {
     Help,
 }
 
-/// La ventanita de descomprimir: a dónde y con qué nombre.
+/// La ventanita de descomprimir (o de comprimir): a dónde y con qué nombre.
 struct Extract {
+    /// true: comprimir `srcs` en un solo archivo `name`
+    pack: bool,
     srcs: Vec<PathBuf>,
     dest: String,
-    /// con varios comprimidos no se usa: cada uno se queda con su nombre
+    /// descomprimiendo varios no se usa: cada uno se queda con su nombre
     name: String,
     on_name: bool,
     /// el cursor, en el campo que esté activo
@@ -97,8 +99,12 @@ impl Extract {
     fn single(&self) -> bool {
         self.srcs.len() == 1
     }
+    /// ¿Lleva el campo del nombre?
+    fn named(&self) -> bool {
+        self.pack || self.single()
+    }
     fn focus(&mut self, on_name: bool) {
-        self.on_name = on_name && self.single();
+        self.on_name = on_name && self.named();
         self.cur = if self.on_name { self.name.chars().count() } else { self.dest.chars().count() };
     }
 }
@@ -580,9 +586,29 @@ impl App {
             return self.warn(l("Eso no es un comprimido", "That's not an archive"));
         };
         let name = archive::folder_name(&first.file_name().unwrap_or_default().to_string_lossy());
-        let mut x = Extract { srcs, dest: files::tilde(&self.real_dir()), name, on_name: false, cur: 0 };
+        let mut x = Extract { pack: false, srcs, dest: files::tilde(&self.real_dir()), name, on_name: false, cur: 0 };
         x.focus(false);
         self.mode = Mode::Extract(x);
+    }
+
+    /// Lo marcado (o lo de abajo del cursor): preguntar a dónde y con qué nombre se comprime.
+    fn ask_compress(&mut self) {
+        let srcs = self.targets();
+        let Some(first) = srcs.first() else {
+            return self.warn(l("No hay nada que comprimir", "Nothing to compress"));
+        };
+        let dest = self.real_dir();
+        let name = archive::pack_name(first, srcs.len() > 1, &self.cwd, &dest);
+        let mut x = Extract { pack: true, srcs, dest: files::tilde(&dest), name, on_name: true, cur: 0 };
+        x.focus(true);
+        self.mode = Mode::Extract(x);
+    }
+
+    fn start_compress(&mut self, x: Extract) {
+        let dest = archive::resolve(&x.dest, &self.cwd);
+        let _ = self.jobs.send(Job::Compress(x.srcs, dest, x.name.trim().to_string()));
+        self.marked.clear();
+        self.job = Some((0, 0, l("comprimiendo…", "compressing…").into()));
     }
 
     /// Por qué no se puede descomprimir así. La ventanita lo enseña mientras se escribe.
@@ -597,13 +623,19 @@ impl App {
         if dentro::is_inside(&dest) {
             return Some(l("Ahí no: es dentro de un comprimido", "Not there: that's inside an archive"));
         }
-        if x.single() {
+        if x.pack && x.srcs.iter().any(|s| dest.starts_with(s)) {
+            return Some(l("Ahí no: es dentro de lo que se comprime", "Not there: that's inside what's being compressed"));
+        }
+        if x.named() {
             let name = x.name.trim();
             if name.is_empty() {
                 return Some(l("Falta el nombre", "It needs a name"));
             }
             if name.contains('/') || name == "." || name == ".." {
                 return Some(l("El nombre no puede llevar /", "The name can't have a /"));
+            }
+            if x.pack && archive::format_of(name).is_none() {
+                return Some(l("Que termine en .zip, .tar.zst, .tar.gz, .tar.xz, .7z o .tar", "End it in .zip, .tar.zst, .tar.gz, .tar.xz, .7z or .tar"));
             }
             if std::fs::symlink_metadata(dest.join(name)).is_ok() {
                 return Some(l("Ya existe, elige otro nombre", "Already exists, pick another name"));
@@ -679,7 +711,8 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal => {
-                let here = k.code == KeyCode::Char('X') || (ctrl && k.code == KeyCode::Char('o'));
+                let here_key = if self.picking.as_ref().is_some_and(|x| x.pack) { 'Z' } else { 'X' };
+                let here = k.code == KeyCode::Char(here_key) || (ctrl && k.code == KeyCode::Char('o'));
                 if self.picking.is_some() && (here || k.code == KeyCode::Esc) {
                     let mut x = self.picking.take().unwrap();
                     if here {
@@ -698,7 +731,7 @@ impl App {
                     KeyCode::Esc => return,
                     KeyCode::Enter => {
                         if self.extract_problem(&x).is_none() {
-                            self.start_extract(x);
+                            if x.pack { self.start_compress(x) } else { self.start_extract(x) }
                         } else {
                             self.mode = Mode::Extract(x);
                         }
@@ -707,6 +740,11 @@ impl App {
                     KeyCode::Char('o') if ctrl => {
                         self.picking = Some(x);
                         return;
+                    }
+                    KeyCode::Char('f') if ctrl && x.pack => {
+                        x.name = archive::next_format(&x.name);
+                        x.on_name = true;
+                        x.cur = x.name.chars().count();
                     }
                     KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => x.focus(!x.on_name),
                     _ => {
@@ -961,6 +999,7 @@ impl App {
             KeyCode::Char('K') => self.pv_scroll = self.pv_scroll.saturating_sub(5),
             KeyCode::Char('P') => self.send_with_picha(),
             KeyCode::Char('X') => self.ask_extract(),
+            KeyCode::Char('Z') => self.ask_compress(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
@@ -1287,14 +1326,24 @@ impl App {
                     Mode::Mounts { .. } => vec![("enter", l("montar y abrir", "mount and open")), ("u", l("desmontar", "unmount")), ("e", l("expulsar", "eject")), ("esc", l("cerrar", "close"))],
                     Mode::Help => vec![("esc", l("cerrar", "close"))],
                     Mode::Extract(x) => {
-                        let mut v = vec![("enter", l("descomprimir", "extract"))];
-                        if x.single() {
+                        let mut v = vec![("enter", if x.pack { l("comprimir", "compress") } else { l("descomprimir", "extract") })];
+                        if x.named() {
                             v.push(("tab", l("cambiar de campo", "switch field")));
+                        }
+                        if x.pack {
+                            v.push(("ctrl+f", l("otro formato", "another format")));
                         }
                         v.push(("ctrl+o", l("buscar la carpeta", "browse for the folder")));
                         v.push(("esc", l("cancelar", "cancel")));
                         v
                     }
+                    Mode::Normal if self.picking.as_ref().is_some_and(|x| x.pack) => vec![
+                        ("Z", l("comprimir aquí", "compress here")),
+                        ("esc", l("volver", "back")),
+                        ("g", l("ir a", "go to")),
+                        ("z", l("saltar", "jump")),
+                        ("a", l("nuevo (con / es carpeta)", "new (ending in / makes a folder)")),
+                    ],
                     Mode::Normal if self.picking.is_some() => vec![
                         ("X", l("descomprimir aquí", "extract here")),
                         ("esc", l("volver", "back")),
@@ -1316,6 +1365,7 @@ impl App {
                         ("g", l("ir a", "go to")),
                         ("M", "usb"),
                         ("X", l("descomprimir", "extract")),
+                        ("Z", l("comprimir", "compress")),
                         ("?", l("ayuda", "help")),
                         ("q", l("salir", "quit")),
                     ],
@@ -1438,9 +1488,10 @@ impl App {
             }
             Mode::Extract(x) => {
                 let first = x.srcs[0].file_name().unwrap_or_default().to_string_lossy().into_owned();
-                let title = if x.single() { format!("{} {first}", l("descomprimir", "extract")) } else { format!("{} {}", l("descomprimir", "extract"), x.srcs.len()) };
+                let verb = if x.pack { l("comprimir", "compress") } else { l("descomprimir", "extract") };
+                let title = if x.single() { format!("{verb} {first}") } else { format!("{verb} {}", x.srcs.len()) };
                 let w = (x.dest.width().max(x.name.width()).max(title.width()) as u16 + 16).max(56);
-                let inner = self.popup(f, w, if x.single() { 5 } else { 4 }, &title);
+                let inner = self.popup(f, w, if x.named() { 5 } else { 4 }, &title);
                 let field = |label: &str, buf: &str, on: bool| {
                     let mut line = if on { input(buf, x.cur) } else { Line::from(Span::styled(format!(" {buf}"), Style::new().fg(t.fg))) };
                     let st = if on { Style::new().fg(t.primary).bold() } else { Style::new().fg(t.muted) };
@@ -1448,15 +1499,15 @@ impl App {
                     line
                 };
                 let mut lines = vec![field(l("dónde", "where"), &x.dest, !x.on_name)];
-                if x.single() {
-                    lines.push(field(l("carpeta", "folder"), &x.name, x.on_name));
+                if x.named() {
+                    lines.push(field(if x.pack { l("nombre", "name") } else { l("carpeta", "folder") }, &x.name, x.on_name));
                 }
                 // lo que va a pasar, o por qué no se puede
                 let dest = archive::resolve(&x.dest, &self.cwd);
                 let last = match self.extract_problem(x) {
                     Some(why) => Span::styled(format!(" {why}"), Style::new().fg(t.red)),
                     None => {
-                        let to = if x.single() { files::tilde(&dest.join(x.name.trim())) } else { format!("{}/…  ({})", files::tilde(&dest), l("cada uno en su carpeta", "each in its own folder")) };
+                        let to = if x.named() { files::tilde(&dest.join(x.name.trim())) } else { format!("{}/…  ({})", files::tilde(&dest), l("cada uno en su carpeta", "each in its own folder")) };
                         let new = if dest.exists() { "" } else { l("  (carpeta nueva)", "  (new folder)") };
                         Span::styled(format!(" → {}{new}", trunc(&to, (inner.width as usize).saturating_sub(4 + new.width()))), Style::new().fg(t.accent))
                     }
@@ -1490,6 +1541,7 @@ impl App {
                     ("!", "una terminal aquí", "a shell here"),
                     ("P", "mandar con picha", "send with picha"),
                     ("X", "descomprimir: eliges a dónde y el nombre de la carpeta", "extract: you pick where and the folder name"),
+                    ("Z", "comprimir lo marcado: a dónde, el nombre, y con ctrl+f el formato", "compress what's marked: where, the name, and ctrl+f for the format"),
                     ("q  Q", "salir (y cd a donde quedó) · salir", "quit (and cd there) · quit"),
                 ];
                 let inner = self.popup(f, 84, keys.len() as u16 + 2, l("teclas", "keys"));

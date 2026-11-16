@@ -239,6 +239,8 @@ pub enum Job {
     Extract(Vec<(PathBuf, String)>, PathBuf),
     /// entrar a un comprimido; true: aunque pese mucho (ya se preguntó)
     Peek(PathBuf, bool),
+    /// lo que se comprime, destino, nombre del comprimido
+    Compress(Vec<PathBuf>, PathBuf, String),
 }
 
 pub enum Progress {
@@ -275,7 +277,7 @@ fn run(job: Job, tx: &Sender<Progress>) -> Result<String, String> {
     let es = crate::spanish();
     let count = |n: usize| if n == 1 { (if es { "1 archivo" } else { "1 item" }).to_string() } else { format!("{n} {}", if es { "archivos" } else { "items" }) };
     match job {
-        Job::Copy(srcs, dst) | Job::Move(srcs, dst) if srcs.iter().any(|s| dst.starts_with(s)) => {
+        Job::Copy(srcs, dst) | Job::Move(srcs, dst) | Job::Compress(srcs, dst, _) if srcs.iter().any(|s| dst.starts_with(s)) => {
             Err(if es { "No se puede meter una carpeta dentro de sí misma".into() } else { "Can't put a folder inside itself".into() })
         }
         Job::Copy(srcs, dst) => {
@@ -328,6 +330,12 @@ fn run(job: Job, tx: &Sender<Progress>) -> Result<String, String> {
             let root = crate::dentro::open(&src).map_err(|e| format!("{}: {e}", name_of(&src)))?;
             let _ = tx.send(Progress::Inside(src, root));
             Ok(String::new())
+        }
+        Job::Compress(srcs, dst, name) => {
+            let what = if srcs.len() == 1 { name_of(&srcs[0]) } else { count(srcs.len()) };
+            let _ = tx.send(Progress::Step(0, 1, what));
+            let to = crate::archive::compress(&srcs, &dst, &name).map_err(|e| format!("{name}: {e}"))?;
+            Ok(format!("{} {}", if es { "Comprimido en" } else { "Compressed to" }, tilde(&to)))
         }
         Job::Extract(srcs, dst) => {
             let n = srcs.len();
